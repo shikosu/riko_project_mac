@@ -59,12 +59,24 @@ def play_audio(path, visemes=None, viseme_callback=None):
                 print(f"[LIPSYNC ERROR] Could not reset viseme: {exc}")
 
 
+def _check_reference_audio(path):
+    """GPT-SoVITS rejects a missing reference or one outside 3-10 seconds with a bare 400."""
+    if not path.is_file():
+        raise FileNotFoundError(f"Reference audio not found: {path} (check ref_audio_path)")
+    duration = sf.info(str(path)).duration
+    if not 3 <= duration <= 10:
+        raise ValueError(
+            f"Reference audio is {duration:.1f} s; GPT-SoVITS needs a 3-10 s clip: {path}"
+        )
+
+
 def sovits_gen(in_text, output_wav_pth="output.wav"):
     """Request a WAV from GPT-SoVITS, validate it, and return its path."""
     url = "http://127.0.0.1:9880/tts"
     ref_audio_path = Path(char_config["sovits_ping_config"]["ref_audio_path"])
     if not ref_audio_path.is_absolute():
         ref_audio_path = CONFIG_FILE.parent / ref_audio_path
+    _check_reference_audio(ref_audio_path)
     payload = {
         "text": in_text,
         "text_lang": char_config["sovits_ping_config"]["text_lang"],
@@ -76,9 +88,11 @@ def sovits_gen(in_text, output_wav_pth="output.wav"):
     print("[TTS] Generating audio...")
     try:
         response = requests.post(url, json=payload, timeout=120)
-        response.raise_for_status()
     except requests.RequestException as exc:
         raise RuntimeError(f"GPT-SoVITS request failed at {url}: {exc}") from exc
+    if not response.ok:
+        # GPT-SoVITS explains 400 errors in the body (e.g. a bad reference clip).
+        raise RuntimeError(f"GPT-SoVITS returned {response.status_code}: {response.text.strip()[:500]}")
 
     if not response.content:
         raise RuntimeError("GPT-SoVITS returned empty audio")

@@ -122,7 +122,7 @@ class AudioTests(unittest.TestCase):
         self.assertEqual(events, ["start", "wait"])
 
     def test_tts_rejects_http_200_without_wav(self):
-        response = types.SimpleNamespace(content=b'{"error":"bad"}', raise_for_status=lambda: None)
+        response = types.SimpleNamespace(content=b'{"error":"bad"}', raise_for_status=lambda: None, ok=True)
         with tempfile.TemporaryDirectory() as temp_dir, \
              patch.object(sovits_ping.requests, "post", return_value=response):
             output = Path(temp_dir) / "output.wav"
@@ -130,10 +130,27 @@ class AudioTests(unittest.TestCase):
                 sovits_ping.sovits_gen("Hello", output)
             self.assertFalse(output.exists())
 
+    def test_tts_reports_gpt_sovits_error_body(self):
+        response = types.SimpleNamespace(ok=False, status_code=400, text='{"message": "tts failed"}')
+        with patch.object(sovits_ping.requests, "post", return_value=response):
+            with self.assertRaisesRegex(RuntimeError, "400.*tts failed"):
+                sovits_ping.sovits_gen("Hello", "output.wav")
+
+    def test_tts_rejects_reference_audio_outside_3_to_10_seconds(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            long_reference = Path(temp_dir) / "long.wav"
+            sf.write(long_reference, [0.0] * 8000 * 12, 8000)
+            config = {**sovits_ping.char_config["sovits_ping_config"], "ref_audio_path": str(long_reference)}
+            with patch.dict(sovits_ping.char_config, {"sovits_ping_config": config}), \
+                 patch.object(sovits_ping.requests, "post") as post:
+                with self.assertRaisesRegex(ValueError, "12.0 s; GPT-SoVITS needs a 3-10 s clip"):
+                    sovits_ping.sovits_gen("Hello", Path(temp_dir) / "output.wav")
+            post.assert_not_called()
+
     def test_tts_resolves_reference_audio_from_project_root(self):
         wav_buffer = io.BytesIO()
         sf.write(wav_buffer, [0.0] * 800, 8000, format="WAV")
-        response = types.SimpleNamespace(content=wav_buffer.getvalue(), raise_for_status=lambda: None)
+        response = types.SimpleNamespace(content=wav_buffer.getvalue(), raise_for_status=lambda: None, ok=True)
         with tempfile.TemporaryDirectory() as temp_dir, \
              patch.object(sovits_ping.requests, "post", return_value=response) as post:
             output = sovits_ping.sovits_gen("Hello", Path(temp_dir) / "output.wav")
@@ -141,7 +158,7 @@ class AudioTests(unittest.TestCase):
 
         self.assertEqual(
             post.call_args.kwargs["json"]["ref_audio_path"],
-            str(PROJECT_ROOT / "character_files/main_sample.wav"),
+            str(PROJECT_ROOT / sovits_ping.char_config["sovits_ping_config"]["ref_audio_path"]),
         )
 
     def test_rhubarb_mapping_and_absolute_wav_path(self):

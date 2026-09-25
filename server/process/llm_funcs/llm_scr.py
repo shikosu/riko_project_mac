@@ -3,6 +3,7 @@
 import json
 import os
 import tempfile
+import time
 from functools import lru_cache
 from pathlib import Path
 
@@ -23,6 +24,9 @@ if not isinstance(FALLBACK_MODELS, list) or not all(
     isinstance(model, str) and model for model in FALLBACK_MODELS
 ):
     raise ValueError("fallback_models must be a list of model names in character_config.yaml")
+MAX_HISTORY_TURNS = char_config.get("max_history_turns", 30)
+if not isinstance(MAX_HISTORY_TURNS, int) or MAX_HISTORY_TURNS < 1:
+    raise ValueError("max_history_turns must be a positive integer in character_config.yaml")
 SYSTEM_PROMPT_TEXT = char_config["presets"]["default"]["system_prompt"]
 SYSTEM_PROMPT = [
     {
@@ -35,10 +39,32 @@ HISTORY_FILE = history_path if history_path.is_absolute() else CONFIG_FILE.paren
 
 
 def load_history():
-    if HISTORY_FILE.exists():
+    if not HISTORY_FILE.exists():
+        return SYSTEM_PROMPT.copy()
+    try:
         with HISTORY_FILE.open("r", encoding="utf-8") as history_file:
-            return json.load(history_file)
-    return SYSTEM_PROMPT.copy()
+            history = json.load(history_file)
+        if not isinstance(history, list) or not all(
+            isinstance(message, dict) and "role" in message for message in history
+        ):
+            raise ValueError("history must be a list of messages")
+        return history
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
+        # Keep the unreadable file for inspection and start a fresh conversation.
+        backup = HISTORY_FILE.with_name(f"{HISTORY_FILE.name}.bak-{time.strftime('%Y%m%d-%H%M%S')}")
+        HISTORY_FILE.replace(backup)
+        print(f"[HISTORY] Unreadable history moved to {backup}: {exc}")
+        return SYSTEM_PROMPT.copy()
+
+
+def context_window(messages):
+    """Current system prompt plus the latest turns; the full history stays on disk."""
+    conversation = [message for message in messages if message["role"] in {"user", "assistant"}]
+    window = conversation[-(MAX_HISTORY_TURNS * 2 + 1):]
+    # Gemini requires the conversation to start with a user turn.
+    while window and window[0]["role"] != "user":
+        window.pop(0)
+    return SYSTEM_PROMPT + window
 
 
 def save_history(history):
@@ -150,10 +176,11 @@ def llm_response(user_input):
     messages = load_history()
     messages.append({"role": "user", "content": [{"type": "input_text", "text": user_input}]})
 
+    window = context_window(messages)
     if PROVIDER == "gemini":
-        answer, model_content, model_used = _gemini_response(messages)
+        answer, model_content, model_used = _gemini_response(window)
     else:
-        answer, model_content, model_used = _openai_response(messages), None, None
+        answer, model_content, model_used = _openai_response(window), None, None
 
     assistant_message = {"role": "assistant", "content": [{"type": "output_text", "text": answer}]}
     if model_content is not None:

@@ -21,6 +21,7 @@ provider: gemini
 history_file: chat_history.json
 model: "gemini-3.8-flash"
 fallback_models: ["gemini-3.5-flash-lite"]
+max_history_turns: 30
 presets:
   default:
     system_prompt: |
@@ -31,12 +32,14 @@ presets:
 sovits_ping_config:
   text_lang: en
   prompt_lang : en
-  ref_audio_path : /path/to/riko_project/character_files/main_sample.wav
-  prompt_text : This is a sample voice for you to just get started with because it sounds kind of cute but just make sure this doesn't have long silences.
+  ref_audio_path : character_files/riko_reference.wav
+  prompt_text : How's everyone doing tonight? Oh my gosh, I see all those hearts. Thank you, thank you so much for the hearts, babes.
 
 ```
 
-You can define personalities by modifying the config file. Set `ref_audio_path` to an absolute path or a path relative to the project root; Riko sends the resolved absolute path to GPT-SoVITS.
+You can define personalities by modifying the config file. Set `ref_audio_path` to an absolute path or a path relative to the project root. GPT-SoVITS only accepts a reference clip of 3 to 10 seconds, and `prompt_text` must be the exact words spoken in it; Riko sends the resolved absolute path to GPT-SoVITS.
+
+The full conversation is kept in `history_file`, but only the current system prompt and the last `max_history_turns` exchanges are sent to the LLM, so requests stay fast and within the model's context. If the history file cannot be read, it is renamed to `chat_history.json.bak-<timestamp>` and a new conversation starts.
 
 If Gemini returns `503 UNAVAILABLE` after its automatic retries, Riko tries each model in `fallback_models` in order. Only a successful reply is saved to chat history. Set `fallback_models: []` to disable this behavior.
 

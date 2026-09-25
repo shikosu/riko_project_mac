@@ -161,7 +161,7 @@ class GeminiResponseTests(unittest.TestCase):
         self.fail_models.update([llm_scr.MODEL, "gemini-3.5-flash-lite"])
 
         with patch.object(llm_scr, "FALLBACK_MODELS", ["gemini-3.5-flash-lite"]):
-            with self.assertRaisesRegex(RuntimeError, "models unavailable \(503\)"):
+            with self.assertRaisesRegex(RuntimeError, r"models unavailable \(503\)"):
                 llm_scr.llm_response("Salut")
 
         self.assertEqual(len(self.requests), 2)
@@ -190,7 +190,8 @@ class GeminiResponseTests(unittest.TestCase):
             answer = llm_scr.llm_response("Bonsoir")
 
         self.assertEqual(answer, "Salut")
-        self.assertEqual(request["input"][1], {"role": "assistant", "content": history[1]["content"]})
+        self.assertEqual(request["input"][0]["role"], "system")
+        self.assertEqual(request["input"][2], {"role": "assistant", "content": history[1]["content"]})
         saved = json.loads(self.history_file.read_text(encoding="utf-8"))
         self.assertEqual(saved[1], history[1])
 
@@ -218,6 +219,35 @@ class GeminiResponseTests(unittest.TestCase):
 
         self.assertEqual(self.history_file.read_text(encoding="utf-8"), original)
         self.assertEqual(list(self.history_file.parent.glob(".chat_history.json.*.tmp")), [])
+
+    def test_only_recent_turns_are_sent_but_full_history_is_saved(self):
+        history = list(llm_scr.SYSTEM_PROMPT)
+        for index in range(5):
+            history.append({"role": "user", "content": [{"type": "input_text", "text": f"u{index}"}]})
+            history.append({"role": "assistant", "content": [{"type": "output_text", "text": f"a{index}"}]})
+        self.history_file.write_text(json.dumps(history), encoding="utf-8")
+
+        with patch.object(llm_scr, "MAX_HISTORY_TURNS", 2):
+            llm_scr.llm_response("latest")
+
+        self.assertEqual(
+            [content.parts[0] for content in self.request["contents"]],
+            ["u3", "a3", "u4", "a4", "latest"],
+        )
+        saved = json.loads(self.history_file.read_text(encoding="utf-8"))
+        self.assertEqual(len(saved), len(history) + 2)
+
+    def test_corrupt_history_is_moved_aside_and_conversation_continues(self):
+        self.history_file.write_text('[{"role": "user", "content": ', encoding="utf-8")
+
+        answer = llm_scr.llm_response("Salut")
+
+        self.assertEqual(answer, "Bonjour senpai")
+        backups = list(self.history_file.parent.glob("chat_history.json.bak-*"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_text(encoding="utf-8"), '[{"role": "user", "content": ')
+        saved = json.loads(self.history_file.read_text(encoding="utf-8"))
+        self.assertEqual(saved[-1]["content"][0]["text"], "Bonjour senpai")
 
 
 if __name__ == "__main__":
