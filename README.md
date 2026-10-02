@@ -106,6 +106,8 @@ The flow:
 5. Synthesizes Riko's voice using GPT-SoVITS
 6. Plays the output back to you
 
+To type instead of speaking, press `T` at the "Press ENTER to start recording, or T to type..." prompt. Each line you type is sent to Riko, who still answers with her voice. Type `/v` or press Ctrl-D to go back to voice mode.
+
 
 ## 📌 TODO / Future Improvements
 

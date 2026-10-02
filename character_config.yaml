@@ -1,6 +1,6 @@
 provider: gemini
 history_file: chat_history.json
-model: "gemini-3.8-flash"
+model: "gemma-4-31b-it"
 fallback_models: []
 max_history_turns: 30
 presets:

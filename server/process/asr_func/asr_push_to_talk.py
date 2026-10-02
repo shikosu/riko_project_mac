@@ -1,9 +1,36 @@
 import os
+import sys
+
 import sounddevice as sd
 import soundfile as sf
 from faster_whisper import WhisperModel
 
-def record_and_transcribe(model, output_file="recording.wav", samplerate=44100):
+def read_key():
+    """Read one keypress from the terminal without waiting for ENTER."""
+    if not sys.stdin.isatty():
+        line = sys.stdin.readline()
+        if not line:
+            raise EOFError
+        return line[0]
+
+    if os.name == "nt":
+        import msvcrt
+
+        return msvcrt.getwch()
+
+    import termios
+    import tty
+
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        return sys.stdin.read(1)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+
+def record_and_transcribe(model, output_file="recording.wav", samplerate=44100, wait_for_start=True):
     """
     Simple push-to-talk recorder: record -> save -> transcribe -> return text
     """
@@ -12,8 +39,9 @@ def record_and_transcribe(model, output_file="recording.wav", samplerate=44100):
     if os.path.exists(output_file):
         os.remove(output_file)
     
-    print("Press ENTER to start recording...")
-    input()
+    if wait_for_start:
+        print("Press ENTER to start recording...")
+        input()
     
     print("🔴 Recording... Press ENTER to stop")
     

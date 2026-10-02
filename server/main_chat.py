@@ -1,4 +1,4 @@
-"""Push-to-talk conversation loop for Riko."""
+"""Push-to-talk and text chat conversation loop for Riko."""
 
 import uuid
 from pathlib import Path
@@ -6,7 +6,7 @@ from pathlib import Path
 import soundfile as sf
 from faster_whisper import WhisperModel
 
-from process.asr_func.asr_push_to_talk import record_and_transcribe
+from process.asr_func.asr_push_to_talk import read_key, record_and_transcribe
 from process.avatar_func.avatar_ws import (
     reset_face,
     set_state,
@@ -81,12 +81,45 @@ def respond(user_spoken_text):
         _remove_wav(output_wav_path)
 
 
+def wait_for_mode():
+    """Return "voice" on ENTER or "chat" on T."""
+    print("Press ENTER to start recording, or T to type...")
+    while True:
+        key = read_key()
+        if key in ("\r", "\n"):
+            return "voice"
+        if key.lower() == "t":
+            return "chat"
+
+
+def chat_mode():
+    """Send typed messages to Riko until the user returns to voice mode."""
+    set_state("idle")
+    print("💬 Chat mode. Type /v or press Ctrl-D to go back to voice mode.")
+    while True:
+        try:
+            user_text = input("You: ").strip()
+        except EOFError:
+            print()
+            break
+        if user_text.lower() == "/v":
+            break
+        if user_text:
+            respond(user_text)
+    print("🎙️  Voice mode.")
+
+
 def main():
     print("\n========= Starting Riko... =========\n")
     start_avatar_server()
     whisper_model = WhisperModel("base.en", device="cpu", compute_type="float32")
 
     while True:
+        set_state("idle")
+        if wait_for_mode() == "chat":
+            chat_mode()
+            continue
+
         set_state("listening")
         conversation_recording = Path("audio") / "conversation.wav"
         conversation_recording.parent.mkdir(parents=True, exist_ok=True)
@@ -95,6 +128,7 @@ def main():
             user_spoken_text = record_and_transcribe(
                 whisper_model,
                 conversation_recording,
+                wait_for_start=False,
             )
             if user_spoken_text:
                 respond(user_spoken_text)
