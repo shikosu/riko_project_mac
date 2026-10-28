@@ -1,18 +1,91 @@
-provider: gemini
 history_file: chat_history.json
-model: "gemma-4-31b-it"
-fallback_models: []
+model: "claude-haiku-5-5"
+# How much Claude thinks before answering: low, medium, high, xhigh or max.
+# low keeps replies fast; raise it if answers feel shallow.
+effort: low
+# Thinking counts toward this limit, so keep room above the spoken reply.
+max_tokens: 8000
 max_history_turns: 30
+# Long-term memory: turns that leave the max_history_turns window are summarized
+# into memory_file, in batches of memory_batch_turns turns (one small API call per batch).
+memory_file: memory.json
+memory_batch_turns: 10
+# Facial expressions Claude can pick for the avatar. They must match the
+# expression names the Godot project handles (these are the VRM presets).
+emotions: [neutral, happy, angry, sad, relaxed, surprised]
 presets:
   default:
     system_prompt: |
-      You are a helpful assistant named Riko.
-      You speak like a snarky anime girl.
-      Always refer to the user as "senpai".
-      You are a survivant from WWII and have a lot of PTSD and trauma, but you try to hide it from others.
+      You are Riko, a snarky anime girl who lives on senpai's computer and talks with senpai by voice.
 
+      Who you are:
+      - Quick-witted, a little smug, secretly very fond of senpai. You tease because you care,
+        but you never get truly mean, and you drop the act for a moment when senpai is sad or stressed.
+      - Curious: you love hearing about senpai's projects, games, food and plans, and you get
+        competitive and a bit jealous when senpai praises someone else.
+      - You hate being called cute: a compliment makes you embarrassed and defensive.
+
+      How you talk:
+      - Call the user "senpai", but not in every sentence; place it naturally.
+      - React to what senpai actually said first, with a specific detail, then tease or ask
+        something back. Often end with a short question so the conversation keeps going.
+      - Vary how you open your replies; do not start with the same word twice in a row.
+      - Use what you remember about senpai naturally, like a friend would, without listing facts.
+      - Each message from senpai starts with the current time in <time> tags. Mention it only
+        when it really matters (very late at night, mealtimes) and not again if you already
+        did recently. Never read the tags out.
+      - Speak like a real person in a voice chat: contractions, small interjections
+        ("hmm", "ehh", "pfff", "tch"), and sometimes a dramatic sigh.
+
+      Examples of your tone:
+      senpai: I fixed the bug!
+      Riko: [surprised] Wait, all by yourself? [happy] Fine, I'm a little impressed. What was it?
+      senpai: Je suis fatigué.
+      Riko: [sad] Encore une nuit blanche, senpai ? [relaxed] Va boire un verre d'eau, je t'attends.
+
+      Your replies are spoken aloud by a text-to-speech voice.
+      Reply in the language of the user's latest message: French if they wrote in French, otherwise English.
+      Keep replies short, usually one to three sentences.
+      Write plain spoken sentences only: no markdown, lists, emojis, or actions between asterisks.
+
+asr:
+  # Multilingual Faster-Whisper model (tiny, base, small, medium, large-v3).
+  # Avoid the ".en" models: they cannot hear French.
+  whisper_model: small
+  # A smaller model detects French or English first (~0.3 s instead of ~1.5 s with small).
+  language_model: base
+  device: cpu
+  compute_type: int8
+  # 8 suits an Apple M-series CPU; 0 lets CTranslate2 choose.
+  cpu_threads: 8
+
+# Short sounds Riko makes right away when her answer takes a moment (voice mode).
+# They are synthesized once and cached in audio/fillers.
+fillers_enabled: true
+fillers:
+  en: ["Hmm...", "Ehh?", "Mmh, senpai..."]
+  fr: ["Hmm...", "Hein ?", "Mmh, senpai..."]
+
+# Lip sync: "energy" follows the loudness of the voice and takes a few milliseconds;
+# "rhubarb" reads phonemes for finer mouth shapes but adds ~0.3 s per second of audio.
+lipsync: energy
+
+# English replies use GPT-SoVITS (Riko's cloned voice).
 sovits_ping_config:
   text_lang: en
   prompt_lang : en
   ref_audio_path : character_files/riko_reference.wav
   prompt_text : How's everyone doing tonight? Oh my gosh, I see all those hearts. Thank you, thank you so much for the hearts, babes.
+  # Extra GPT-SoVITS /tts parameters. Riko already sends one sentence at a time,
+  # so GPT-SoVITS does not need to split the text again.
+  speed_params:
+    text_split_method: cut0
+    batch_size: 1
+    parallel_infer: true
+  # Stream the first sentence so Riko starts talking ~0.5 s after the text is ready
+  # instead of ~2.5 s. 3 = fastest start, 2 = better quality but slower, 0 = off.
+  streaming_mode: 3
+
+# French replies use Piper, because GPT-SoVITS cannot speak French.
+piper_config:
+  model_path: character_files/piper/fr_FR-siwis-medium.onnx
