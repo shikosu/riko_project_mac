@@ -9,12 +9,63 @@ if [[ -f "$project_dir/.env" ]]; then
     set +a
 fi
 
-sovits_dir="$project_dir/third_party/GPT-SoVITS"
-sovits_python="$project_dir/third_party/miniforge3/envs/gpt-sovits/bin/python"
+# Each location can be overridden in .env or the shell:
+# SOVITS_DIR, SOVITS_PYTHON, SOVITS_CONFIG, GODOT, AVATAR_DIR.
+sovits_dir="${SOVITS_DIR:-$project_dir/third_party/GPT-SoVITS}"
+sovits_config="${SOVITS_CONFIG:-GPT_SoVITS/configs/tts_infer.yaml}"
 
 riko_python="$project_dir/.venv/bin/python"
 
-godot_project="$HOME/riko-avatar/project.godot"
+avatar_dir="${AVATAR_DIR:-$HOME/riko-avatar}"
+godot_project="$avatar_dir/project.godot"
+
+
+find_sovits_python() {
+    local candidate
+
+    # The bundled Linux install first, then the usual conda/miniforge homes on macOS and Linux.
+    for candidate in \
+        "${SOVITS_PYTHON:-}" \
+        "$project_dir/third_party/miniforge3/envs/gpt-sovits/bin/python" \
+        "$HOME/miniforge3/envs/gpt-sovits/bin/python" \
+        "$HOME/miniconda3/envs/gpt-sovits/bin/python" \
+        "$HOME/anaconda3/envs/gpt-sovits/bin/python" \
+        "/opt/homebrew/Caskroom/miniforge/base/envs/gpt-sovits/bin/python" \
+        "/opt/homebrew/Caskroom/miniconda/base/envs/gpt-sovits/bin/python" \
+        "$sovits_dir/.venv/bin/python"
+    do
+        if [[ -n "$candidate" && -x "$candidate" ]]; then
+            echo "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+
+find_godot() {
+    local candidate
+
+    if [[ -n "${GODOT:-}" ]]; then
+        echo "$GODOT"
+        return 0
+    fi
+    if command -v godot >/dev/null 2>&1; then
+        command -v godot
+        return 0
+    fi
+    # macOS installs Godot as an app bundle without a command on PATH.
+    for candidate in \
+        "/Applications/Godot.app/Contents/MacOS/Godot" \
+        "$HOME/Applications/Godot.app/Contents/MacOS/Godot"
+    do
+        if [[ -x "$candidate" ]]; then
+            echo "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
 
 api_url="http://127.0.0.1:9880"
 
@@ -73,8 +124,12 @@ fi
 # CHECK GPT-SOVITS
 # ============================================================
 
-if [[ ! -x "$sovits_python" || ! -f "$sovits_dir/api_v2.py" ]]; then
+sovits_python="$(find_sovits_python)" || sovits_python=""
+
+if [[ -z "$sovits_python" || ! -f "$sovits_dir/api_v2.py" ]]; then
     echo "GPT-SoVITS is missing." >&2
+    echo "Expected api_v2.py in: $sovits_dir (set SOVITS_DIR)" >&2
+    echo "and a 'gpt-sovits' conda environment (set SOVITS_PYTHON to its python)." >&2
     exit 1
 fi
 
@@ -94,7 +149,7 @@ if ! api_ready; then
             api_v2.py \
             -a 127.0.0.1 \
             -p 9880 \
-            -c GPT_SoVITS/configs/tts_infer.yaml
+            -c "$sovits_config"
 
     ) > "$project_dir/audio/sovits.log" 2>&1 &
 
@@ -139,16 +194,20 @@ echo "GPT-SoVITS API ready."
 # START GODOT AVATAR
 # ============================================================
 
-if [[ -f "$godot_project" ]]; then
+if [[ -f "$godot_project" ]] && godot_bin="$(find_godot)"; then
 
     echo "Starting Riko avatar..."
 
-    godot \
-        --path "$HOME/riko-avatar" \
+    "$godot_bin" \
+        --path "$avatar_dir" \
         --editor \
         "$godot_project" &
 
     godot_pid=$!
+
+elif [[ -f "$godot_project" ]]; then
+
+    echo "WARNING: Godot not found; set GODOT to its executable."
 
 else
 

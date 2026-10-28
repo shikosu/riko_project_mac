@@ -4,7 +4,11 @@ __pycache__/
 /chat_history.json
 /chat_history.json.bak-*
 /.chat_history.json.*.tmp
+/memory.json
+/memory.json.bak-*
+/.memory.json.*.tmp
 /audio/
 /third_party/
 .env
 /test.py
+/character_files/piper/
