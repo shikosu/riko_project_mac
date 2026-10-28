@@ -1,8 +1,9 @@
-"""Text responses and conversation history for the configured LLM provider."""
+"""Claude text responses and conversation history."""
 
 import json
 import os
 import tempfile
+import threading
 import time
 from functools import lru_cache
 from pathlib import Path
@@ -14,28 +15,61 @@ CONFIG_FILE = Path(__file__).resolve().parents[3] / "character_config.yaml"
 with CONFIG_FILE.open("r", encoding="utf-8") as config_file:
     char_config = yaml.safe_load(config_file)
 
-PROVIDER = char_config.get("provider", "openai").lower()
-if PROVIDER not in {"openai", "gemini"}:
-    raise ValueError("provider must be 'openai' or 'gemini' in character_config.yaml")
-
-MODEL = char_config["model"]
-FALLBACK_MODELS = char_config.get("fallback_models", [])
-if not isinstance(FALLBACK_MODELS, list) or not all(
-    isinstance(model, str) and model for model in FALLBACK_MODELS
-):
-    raise ValueError("fallback_models must be a list of model names in character_config.yaml")
+MODEL = char_config.get("model", "claude-sonnet-5-5")
+EFFORT = char_config.get("effort", "low")
+if EFFORT not in {"low", "medium", "high", "xhigh", "max"}:
+    raise ValueError("effort must be low, medium, high, xhigh or max in character_config.yaml")
+MAX_TOKENS = char_config.get("max_tokens", 8000)
+if not isinstance(MAX_TOKENS, int) or MAX_TOKENS < 1:
+    raise ValueError("max_tokens must be a positive integer in character_config.yaml")
+# Retries the request on another Claude model when a safety classifier declines it.
+FALLBACK_BETA = "server-side-fallback-2026-07-01"
 MAX_HISTORY_TURNS = char_config.get("max_history_turns", 30)
 if not isinstance(MAX_HISTORY_TURNS, int) or MAX_HISTORY_TURNS < 1:
     raise ValueError("max_history_turns must be a positive integer in character_config.yaml")
-SYSTEM_PROMPT_TEXT = char_config["presets"]["default"]["system_prompt"]
+EMOTIONS = [emotion.lower() for emotion in char_config.get("emotions", [])]
+EMOTION_RULE = (
+    "\n\nStart each reply with your facial expression in square brackets, one of: "
+    + ", ".join(f"[{emotion}]" for emotion in EMOTIONS)
+    + ". When your mood changes later in the reply, put a new tag before that sentence. "
+    "Use only those exact tags, with no other words inside the brackets. "
+    "The tags move your avatar's face and are never read aloud."
+)
+INTERRUPTED_MARK = "[interrupted]"
+INTERRUPTED_RULE = (
+    f"\n\nIf one of your earlier replies ends with {INTERRUPTED_MARK}, the user cut you off there "
+    "and only heard the words before it. Never write that mark yourself."
+)
+SYSTEM_PROMPT_TEXT = char_config["presets"]["default"]["system_prompt"].rstrip() + (
+    EMOTION_RULE if EMOTIONS else ""
+) + INTERRUPTED_RULE
 SYSTEM_PROMPT = [
     {
         "role": "system",
         "content": [{"type": "input_text", "text": SYSTEM_PROMPT_TEXT}],
     }
 ]
-history_path = Path(char_config["history_file"])
-HISTORY_FILE = history_path if history_path.is_absolute() else CONFIG_FILE.parent / history_path
+
+
+def _project_path(value):
+    path = Path(value)
+    return path if path.is_absolute() else CONFIG_FILE.parent / path
+
+
+HISTORY_FILE = _project_path(char_config["history_file"])
+MEMORY_FILE = _project_path(char_config.get("memory_file", "memory.json"))
+MEMORY_BATCH_TURNS = char_config.get("memory_batch_turns", 10)
+if not isinstance(MEMORY_BATCH_TURNS, int) or MEMORY_BATCH_TURNS < 1:
+    raise ValueError("memory_batch_turns must be a positive integer in character_config.yaml")
+MEMORY_MODEL = char_config.get("memory_model", MODEL)
+MEMORY_PROMPT = """You maintain the long-term memory of Riko, a voice companion, about the person she talks with.
+You receive her current memory and an older part of the conversation that is leaving her short-term context.
+Rewrite the memory so it also keeps what matters from that conversation: facts about the person (name, life, \
+tastes, plans), important events, promises, and running jokes or how the relationship feels.
+Drop small talk and anything already covered. Keep it under 300 words, as short plain-text lines in English.
+Reply with the updated memory only."""
+_memory_lock = threading.Lock()
+_history_lock = threading.Lock()  # a finished reply and an interruption may save at the same time
 
 
 def load_history():
@@ -51,141 +85,229 @@ def load_history():
         return history
     except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
         # Keep the unreadable file for inspection and start a fresh conversation.
-        backup = HISTORY_FILE.with_name(f"{HISTORY_FILE.name}.bak-{time.strftime('%Y%m%d-%H%M%S')}")
-        HISTORY_FILE.replace(backup)
-        print(f"[HISTORY] Unreadable history moved to {backup}: {exc}")
+        _move_aside(HISTORY_FILE, "history", exc)
         return SYSTEM_PROMPT.copy()
+
+
+def _move_aside(path, label, exc):
+    backup = path.with_name(f"{path.name}.bak-{time.strftime('%Y%m%d-%H%M%S')}")
+    path.replace(backup)
+    print(f"[{label.upper()}] Unreadable {label} moved to {backup}: {exc}")
 
 
 def context_window(messages):
     """Current system prompt plus the latest turns; the full history stays on disk."""
     conversation = [message for message in messages if message["role"] in {"user", "assistant"}]
     window = conversation[-(MAX_HISTORY_TURNS * 2 + 1):]
-    # Gemini requires the conversation to start with a user turn.
+    # Claude requires the conversation to start with a user turn.
     while window and window[0]["role"] != "user":
         window.pop(0)
     return SYSTEM_PROMPT + window
 
 
-def save_history(history):
-    HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+def _write_json_atomically(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = None
     try:
         with tempfile.NamedTemporaryFile(
             mode="w",
             encoding="utf-8",
-            dir=HISTORY_FILE.parent,
-            prefix=f".{HISTORY_FILE.name}.",
+            dir=path.parent,
+            prefix=f".{path.name}.",
             suffix=".tmp",
             delete=False,
-        ) as history_file:
-            temp_path = Path(history_file.name)
-            json.dump(history, history_file, indent=2, ensure_ascii=False)
-            history_file.flush()
-            os.fsync(history_file.fileno())
-        os.replace(temp_path, HISTORY_FILE)
+        ) as json_file:
+            temp_path = Path(json_file.name)
+            json.dump(data, json_file, indent=2, ensure_ascii=False)
+            json_file.flush()
+            os.fsync(json_file.fileno())
+        os.replace(temp_path, path)
     finally:
         if temp_path is not None:
             temp_path.unlink(missing_ok=True)
 
 
-@lru_cache(maxsize=1)
-def _openai_client():
-    from openai import OpenAI
-
-    api_key = os.environ.get("OPENAI_API_KEY") or char_config.get("OPENAI_API_KEY")
-    if not api_key or api_key == "sk-YOURAPIKEY":
-        raise RuntimeError("Set OPENAI_API_KEY to use the OpenAI provider.")
-    return OpenAI(api_key=api_key)
+def save_history(history):
+    _write_json_atomically(HISTORY_FILE, history)
 
 
-@lru_cache(maxsize=1)
-def _gemini_client():
-    from google import genai
+def load_memory():
+    """Long-term summary of the turns that no longer fit in the context window."""
+    empty = {"summary": "", "summarized_messages": 0}
+    if not MEMORY_FILE.exists():
+        return empty
+    try:
+        with MEMORY_FILE.open("r", encoding="utf-8") as memory_file:
+            memory = json.load(memory_file)
+        if not (
+            isinstance(memory, dict)
+            and isinstance(memory.get("summary"), str)
+            and isinstance(memory.get("summarized_messages"), int)
+        ):
+            raise ValueError("memory must hold a summary and a summarized_messages count")
+        return memory
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
+        _move_aside(MEMORY_FILE, "memory", exc)
+        return empty
 
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        raise RuntimeError("Set GEMINI_API_KEY to use the Gemini provider.")
-    return genai.Client(api_key=api_key)
+
+def _system_prompt(memory):
+    if not memory["summary"]:
+        return SYSTEM_PROMPT_TEXT
+    return (
+        f"{SYSTEM_PROMPT_TEXT}\n\n"
+        f"What you remember from earlier conversations with the user:\n{memory['summary']}"
+    )
 
 
 def _message_text(message):
-    """Read the text from both plain and existing OpenAI Responses history."""
+    """Read the text from plain and structured (older OpenAI/Gemini) history."""
     content = message.get("content", "")
     if isinstance(content, str):
         return content
     return "\n".join(part["text"] for part in content if isinstance(part, dict) and "text" in part)
 
 
-def _gemini_response(messages):
-    from google.genai import errors, types
+@lru_cache(maxsize=1)
+def _claude_client():
+    import anthropic
 
-    models = list(dict.fromkeys([MODEL, *FALLBACK_MODELS]))
-    for index, model in enumerate(models):
-        contents = [
-            types.Content.model_validate_json(json.dumps(message["gemini_content"]))
-            if message.get("gemini_content") and message.get("gemini_model") == model
-            else types.Content(
-                role="model" if message["role"] == "assistant" else "user",
-                parts=[types.Part.from_text(text=_message_text(message))],
-            )
-            for message in messages
-            if message["role"] in {"user", "assistant"}
-        ]
-        try:
-            response = _gemini_client().models.generate_content(
-                model=model,
-                contents=contents,
-                config=types.GenerateContentConfig(
-                    system_instruction=SYSTEM_PROMPT_TEXT,
-                    temperature=1,
-                    max_output_tokens=2048,
-                ),
-            )
-        except errors.ServerError as exc:
-            if exc.code != 503:
-                raise
-            if index == len(models) - 1:
-                raise RuntimeError(
-                    f"Gemini models unavailable (503): {', '.join(models)}. Try again later."
-                ) from exc
-            print(f"Gemini model {model} unavailable (503); trying {models[index + 1]}.")
-            continue
-
-        if not response.text:
-            raise RuntimeError("Gemini returned no text; the conversation history was not saved.")
-        # Keep the complete model turn so Gemini thought signatures survive restarts.
-        model_content = response.candidates[0].content.to_json_dict()
-        return response.text, model_content, model
+    if not (os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")):
+        raise RuntimeError("Set ANTHROPIC_API_KEY (for example in .env) to use Claude.")
+    return anthropic.Anthropic(max_retries=3, timeout=60.0)
 
 
-def _openai_response(messages):
-    response = _openai_client().responses.create(
-        model=MODEL,
-        input=[{"role": message["role"], "content": message["content"]} for message in messages],
-        temperature=1,
-        top_p=1,
-        max_output_tokens=2048,
-        stream=False,
-        text={"format": {"type": "text"}},
-    )
-    return response.output_text
+def warm_up():
+    """Create the client at startup so a missing key fails before the first turn."""
+    _claude_client()
 
 
-def llm_response(user_input):
+def _claude_messages(messages):
+    # Only text is replayed: the window drops old turns, which would invalidate thinking blocks.
+    return [
+        {"role": message["role"], "content": _message_text(message)}
+        for message in messages
+        if message["role"] in {"user", "assistant"}
+    ]
+
+
+def _with_time(messages):
+    """Tell Claude the current time in the latest message only, so earlier turns stay cached."""
+    now = time.strftime("%A %d %B %Y, %H:%M")
+    latest = messages[-1]
+    return messages[:-1] + [{**latest, "content": f"<time>{now}</time>\n{latest['content']}"}]
+
+
+def stream_reply(user_input, turn=None):
+    """Yield Claude's reply as text chunks; save the turn once the reply is complete.
+
+    turn, a dict shared with save_interrupted_turn, records whether this turn was saved.
+    """
+    turn = {} if turn is None else turn
     messages = load_history()
     messages.append({"role": "user", "content": [{"type": "input_text", "text": user_input}]})
 
-    window = context_window(messages)
-    if PROVIDER == "gemini":
-        answer, model_content, model_used = _gemini_response(window)
-    else:
-        answer, model_content, model_used = _openai_response(window), None, None
+    chunks = []
+    with _claude_client().beta.messages.stream(
+        model=MODEL,
+        max_tokens=MAX_TOKENS,
+        system=_system_prompt(load_memory()),
+        messages=_with_time(_claude_messages(context_window(messages))),
+        output_config={"effort": EFFORT},
+        cache_control={"type": "ephemeral"},
+        betas=[FALLBACK_BETA],
+        fallbacks="default",
+    ) as stream:
+        for text in stream.text_stream:
+            chunks.append(text)
+            yield text
+        final = stream.get_final_message()
 
-    assistant_message = {"role": "assistant", "content": [{"type": "output_text", "text": answer}]}
-    if model_content is not None:
-        assistant_message["gemini_content"] = model_content
-        assistant_message["gemini_model"] = model_used
-    messages.append(assistant_message)
-    save_history(messages)
-    return answer
+    if final.stop_reason == "refusal":
+        category = final.stop_details.category if final.stop_details else None
+        raise RuntimeError(f"Claude declined to answer ({category}); the history was not saved.")
+    answer = "".join(chunks).strip()
+    if not answer:
+        raise RuntimeError("Claude returned no text; the history was not saved.")
+    if final.stop_reason == "max_tokens":
+        print(f"[LLM] Reply cut off at max_tokens={MAX_TOKENS}; raise it in character_config.yaml.")
+
+    messages.append({"role": "assistant", "content": [{"type": "output_text", "text": answer}]})
+    with _history_lock:
+        if turn.get("interrupted"):
+            return  # save_interrupted_turn already kept what the user heard
+        save_history(messages)
+        turn["saved"] = True
+    remember_in_background(messages)
+
+
+def save_interrupted_turn(user_input, spoken, turn):
+    """Keep only the part of the reply the user heard before cutting Riko off."""
+    answer = f"{spoken} {INTERRUPTED_MARK}".strip()
+    with _history_lock:
+        turn["interrupted"] = True
+        messages = load_history()
+        if turn.get("saved") and messages and messages[-1]["role"] == "assistant":
+            messages.pop()  # the full reply, which she did not finish saying
+        else:
+            messages.append({"role": "user", "content": [{"type": "input_text", "text": user_input}]})
+        messages.append({"role": "assistant", "content": [{"type": "output_text", "text": answer}]})
+        save_history(messages)
+    print(f"[LLM] Reply cut off; saved what was said: {answer}")
+
+
+def llm_response(user_input):
+    return "".join(stream_reply(user_input)).strip()
+
+
+def update_memory(messages):
+    """Fold turns that left the context window into the summary; return True if it changed."""
+    conversation = [message for message in messages if message["role"] in {"user", "assistant"}]
+    with _memory_lock:
+        memory = load_memory()
+        done = memory["summarized_messages"]
+        if done > len(conversation):
+            done = 0  # the history was reset; the summary stays, the count starts over
+        # Messages before this index are no longer sent with the next request.
+        outside = len(conversation) - MAX_HISTORY_TURNS * 2
+        if outside - done < MEMORY_BATCH_TURNS * 2:
+            return False
+
+        excerpt = "\n".join(
+            f"{'User' if message['role'] == 'user' else 'Riko'}: {_message_text(message)}"
+            for message in conversation[done:outside]
+        )
+        response = _claude_client().beta.messages.create(
+            model=MEMORY_MODEL,
+            max_tokens=4000,
+            system=MEMORY_PROMPT,
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"<memory>\n{memory['summary'] or '(empty)'}\n</memory>\n\n"
+                    f"<conversation>\n{excerpt}\n</conversation>"
+                ),
+            }],
+            output_config={"effort": "low"},
+            betas=[FALLBACK_BETA],
+            fallbacks="default",
+        )
+        summary = "".join(block.text for block in response.content if block.type == "text").strip()
+        if response.stop_reason == "refusal" or not summary:
+            print("[MEMORY] Summary not updated; Claude returned no summary.")
+            return False
+
+        _write_json_atomically(MEMORY_FILE, {"summary": summary, "summarized_messages": outside})
+        print(f"[MEMORY] Summarized {outside - done} older messages.")
+        return True
+
+
+def remember_in_background(messages):
+    """Update the summary without delaying the spoken reply."""
+    def run():
+        try:
+            update_memory(messages)
+        except Exception as exc:
+            print(f"[MEMORY ERROR] {exc}")
+
+    threading.Thread(target=run, daemon=True, name="RikoMemory").start()
